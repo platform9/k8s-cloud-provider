@@ -242,6 +242,7 @@ func (cnc *CloudNodeController) processNextWorkItem() bool {
 
 // syncHandler implements the logic of the controller.
 func (cnc *CloudNodeController) syncHandler(key string) error {
+	fmt.Printf("ARJUN: syncHandler: key = %+v\n", key)
 	_, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("invalid resource key: %s", key))
@@ -266,9 +267,9 @@ func (cnc *CloudNodeController) UpdateNodeStatus(ctx context.Context) error {
 	updateNodeFunc := func(piece int) {
 		node := nodes[piece].DeepCopy()
 		// Do not process nodes that are still tainted, those will be processed by syncNode()
-		cloudTaint := getCloudTaint(node.Spec.Taints)
-		if cloudTaint != nil {
-			klog.V(5).Infof("This node %s is still tainted. Will not process.", node.Name)
+		ngpcInitialized := getNGPCInitializedAnnotation(node)
+		if ngpcInitialized != "initialized" {
+			fmt.Printf("Node is not NGPC initialized, skipping: %s\n", ngpcInitialized)
 			return
 		}
 
@@ -355,9 +356,9 @@ func (cnc *CloudNodeController) reconcileNodeLabels(nodeName string) error {
 // UpdateNodeAddress updates the nodeAddress of a single node
 func (cnc *CloudNodeController) updateNodeAddress(ctx context.Context, node *v1.Node, instanceMetadata *cloudprovider.InstanceMetadata) {
 	// Do not process nodes that are still tainted
-	cloudTaint := getCloudTaint(node.Spec.Taints)
-	if cloudTaint != nil {
-		klog.V(5).Infof("This node %s is still tainted. Will not process.", node.Name)
+	ngpcInitialized := getNGPCInitializedAnnotation(node)
+	if ngpcInitialized != "initialized" {
+		fmt.Printf("Node is not NGPC initialized, skipping: %s\n", ngpcInitialized)
 		return
 	}
 
@@ -408,6 +409,7 @@ type nodeModifier func(*v1.Node)
 // syncNode handles updating existing nodes registered with the cloud taint
 // and processes nodes that were added into the cluster, and cloud initialize them if appropriate.
 func (cnc *CloudNodeController) syncNode(ctx context.Context, nodeName string) error {
+	fmt.Printf("ARJUN: syncNode: nodeName= %s\n", nodeName)
 	curNode, err := cnc.nodeInformer.Lister().Get(nodeName)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -417,10 +419,9 @@ func (cnc *CloudNodeController) syncNode(ctx context.Context, nodeName string) e
 		return err
 	}
 
-	cloudTaint := getCloudTaint(curNode.Spec.Taints)
-	if cloudTaint == nil {
-		// Node object received from event had the cloud taint but was outdated,
-		// the node has actually already been initialized, so this sync event can be ignored.
+	ngpcInitialized := getNGPCInitializedAnnotation(curNode)
+	if ngpcInitialized == "initialized" {
+		fmt.Printf("Node has already been processed: %s\n", ngpcInitialized)
 		return nil
 	}
 
@@ -567,6 +568,13 @@ func (cnc *CloudNodeController) getNodeModifiersFromCloudProvider(
 		})
 	}
 
+	nodeModifiers = append(nodeModifiers, func(n *v1.Node) {
+		if n.Annotations == nil {
+			n.Annotations = map[string]string{}
+		}
+		n.Annotations["ngpc.pf9.io/cloudProvider"] = "initialized"
+	})
+
 	return nodeModifiers, nil
 }
 
@@ -574,7 +582,7 @@ func (cnc *CloudNodeController) getProviderID(ctx context.Context, node *v1.Node
 	if node.Spec.ProviderID != "" {
 		return node.Spec.ProviderID, nil
 	}
-
+	fmt.Printf("ARJUN: getProviderID: node = %s\n", node.GetName())
 	if _, ok := cnc.cloud.InstancesV2(); ok {
 		// We don't need providerID when we call InstanceMetadata for InstancesV2
 		return "", nil
@@ -582,6 +590,7 @@ func (cnc *CloudNodeController) getProviderID(ctx context.Context, node *v1.Node
 
 	providerID, err := cloudprovider.GetInstanceProviderID(ctx, cnc.cloud, types.NodeName(node.Name))
 	if err == cloudprovider.NotImplemented {
+		fmt.Printf("ARJUN: cloudprovider does not implement ProviderID\n")
 		// if the cloud provider being used does not support provider IDs,
 		// we can safely continue since we will attempt to set node
 		// addresses given the node name in getNodeAddressesByProviderIDOrName
@@ -681,6 +690,18 @@ func excludeCloudTaint(taints []v1.Taint) []v1.Taint {
 		newTaints = append(newTaints, taint)
 	}
 	return newTaints
+}
+
+func getNGPCInitializedAnnotation(node *v1.Node) string {
+	if node.Annotations == nil {
+		return ""
+	}
+
+	annotation, ok := node.Annotations["ngpc.pf9.io/cloudProvider"]
+	if !ok {
+		return ""
+	}
+	return annotation
 }
 
 // ensureNodeExistsByProviderID checks if the instance exists by the provider id,
